@@ -79,88 +79,77 @@ async def capture(case_number: str = Form(...)):
     filename = f"Voluntary_Petition_{case_number}.pdf"
 
     try:
-        # Ensure browsers are present (belt & suspenders)
+        # Make sure Chromium is present (belt & suspenders)
         os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
         subprocess.run(["python", "-m", "playwright", "install", "chromium"], check=True)
 
         async with async_playwright() as p:
-            async def launch():
-                return await p.chromium.launch(headless=HEADLESS, args=BROWSER_ARGS)
-
-            try:
-                browser = await launch()
-            except Exception:
-                subprocess.run(["python", "-m", "playwright", "install", "chromium"], check=True)
-                browser = await launch()
-
+            browser = await p.chromium.launch(
+                headless=HEADLESS,
+                args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
             context = await browser.new_context(
                 accept_downloads=True,
                 viewport={"width": 1400, "height": 1800},
                 user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
             )
-            page = await context.new_page()
 
-            # ---- Login ----
+            # 🚫 Block heavy assets to speed up navigation
+            page = await context.new_page()
+            await page.route("**/*", lambda route: (
+                route.abort() if route.request.resource_type in {"image", "font", "media"} else route.continue_()
+            ))
+
+            # 1) Login
             await page.goto("https://v2.courtdrive.com/login")
             await page.fill('input[name="email"]', COURTDRIVE_USERNAME)
             await page.fill('input[name="password"]', COURTDRIVE_PASSWORD)
             await page.click('button[type="submit"]')
             await page.wait_for_load_state("networkidle")
-            await asyncio.sleep(0.8)
 
-            # ---- Case page ----
+            # 2) Go to case dockets
             case_url = f"{BASE_URL}{case_number}/dockets"
             await page.goto(case_url)
             await page.wait_for_load_state("networkidle")
-            await asyncio.sleep(1.0)
 
-            # ---- Find search input OR detect blockers ----
-            sel = await wait_for_any_selector(page, SEARCH_SELECTORS, timeout=30000)
-            if not sel:
-                text = (await page.content())[:100000]
-                if any(t.lower() in text.lower() for t in BLOCKER_TEXT):
-                    html_path, png_path = await dump_debug(page, tag="blocker")
-                    await browser.close()
-                    return JSONResponse(
-                        status_code=502,
-                        content={
-                            "error": "Search input not visible; page likely blocked (login/MFA/cookies/upgrade).",
-                            "debug_html": html_path,
-                            "debug_png": png_path,
-                        },
-                    )
-                html_path, png_path = await dump_debug(page, tag="nosel")
-                await browser.close()
-                return JSONResponse(
-                    status_code=502,
-                    content={
-                        "error": "Search input selector not found on case dockets page.",
-                        "debug_html": html_path,
-                        "debug_png": png_path,
-                    },
-                )
+            # 3) Find the docket row that contains "Voluntary Petition"
+            #    We try a few robust locators; fastest match wins.
+            row = None
+            try:
+                # Try role-based row match
+                row = page.get_by_role("row", name=lambda n: n and "voluntary petition" in n.lower()).first
+                await row.wait_for(state="visible", timeout=8000)
+            except Exception:
+                row = None
 
-            # ---- Use the found selector ----
-            search = page.locator(sel).first
-            await search.click()
-            await search.fill("")
-            await search.type("Voluntary Petition", delay=60)
-            await page.keyboard.press("Enter")
+            if row is None:
+                # Fallback: broader text match
+                # Find any element with the text, then climb to nearest row/container
+                match = page.locator("text=Voluntary Petition").first
+                await match.wait_for(state="visible", timeout=12000)
+                # Try to get the closest row-like ancestor
+                row = match.locator("xpath=ancestor-or-self::*[self::tr or contains(@role,'row')][1]")
 
-            await page.wait_for_selector("text=Voluntary Petition", state="visible", timeout=30000)
-            await asyncio.sleep(1.0)
+            # Ensure row is visible and stable
+            await row.scroll_into_view_if_needed()
+            await row.wait_for(state="visible", timeout=5000)
 
-            # ---- Your tabbing flow ----
-            for _ in range(21):
-                await page.keyboard.press("Tab")
-                await asyncio.sleep(0.1)
-            await page.keyboard.press("Enter")
-            for _ in range(3):
-                await page.keyboard.press("Tab")
-                await asyncio.sleep(0.1)
+            # 4) Inside that row, click the PDF link (or expand if needed)
+            pdf_link = row.get_by_role("link", name=lambda n: n and "pdf" in n.lower())
+            if not await pdf_link.count():
+                # If the row needs expanding, try a chevron/toggle within the row
+                toggle = row.locator("button[aria-label*='toggle'], .chevron, .expand-icon").first
+                if await toggle.count():
+                    await toggle.click()
+                    await page.wait_for_load_state("networkidle")
+                    pdf_link = row.get_by_role("link", name=lambda n: n and "pdf" in n.lower())
 
+            # Wait for a PDF link to become visible
+            await pdf_link.first.wait_for(state="visible", timeout=10000)
+
+            # 5) Download the PDF
             async with page.expect_download() as dl_info:
-                await page.keyboard.press("Enter")
+                await pdf_link.first.click()
             download = await dl_info.value
             await download.save_as(filename)
 
@@ -170,8 +159,15 @@ async def capture(case_number: str = Form(...)):
 
     except Exception as e:
         traceback.print_exc()
+        # quick HTML dump for debugging when it fails
+        try:
+            html = await page.content()
+            with open("/opt/render/project/src/debug_last.html", "w", encoding="utf-8") as f:
+                f.write(html)
+        except Exception:
+            pass
         return JSONResponse(status_code=500, content={"error": str(e)})
-
+        
 @app.get("/debug/last-html", response_class=PlainTextResponse)
 async def debug_last_html():
     path = "/opt/render/project/src/debug_nosel.html"
@@ -179,6 +175,7 @@ async def debug_last_html():
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
     return "No debug file found."
+
 
 
 
