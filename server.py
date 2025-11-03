@@ -8,17 +8,19 @@ app = FastAPI()
 COURTDRIVE_USERNAME = os.getenv("COURTDRIVE_USERNAME", "chad@cvhlawgroup.com")
 COURTDRIVE_PASSWORD = os.getenv("COURTDRIVE_PASSWORD", "Ch@d2201")
 HEADLESS = True
-BASE_URL = "https://v2.courtdrive.com/cases/pacer/flsbke/0:25-bk-"
+BASE_URL = "https://v2.courtdrive.com/cases/pacer/flsbke/1:25-bk-"
 BROWSER_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
+
 SEARCH_SELECTORS = [
     "input[placeholder*='Search']",
     "input[placeholder*='search']",
     "input[aria-label*='Search']",
     "input[aria-label*='search']",
 ]
+
 BLOCKER_TEXT = [
-    "Sign in", "Log in", "Two-Factor", "MFA", "Access denied", "Upgrade",
-    "Cookies", "Accept all", "verification code"
+    "Sign in", "Log in", "Two-Factor", "MFA", "Access denied",
+    "Upgrade", "Cookies", "Accept all", "verification code",
 ]
 
 @app.get("/")
@@ -28,7 +30,6 @@ async def root():
 @app.get("/debug/launch")
 async def debug_launch():
     try:
-        # Ensure browsers path is stable
         os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
         subprocess.run(["python", "-m", "playwright", "install", "chromium"], check=True)
         async with async_playwright() as p:
@@ -48,28 +49,20 @@ def ensure_chromium():
         print("⚠️ Startup Chromium install failed:", e)
 
 async def wait_for_any_selector(page, selectors, timeout=30000):
-    tasks = [page.wait_for_selector(sel, state="visible", timeout=timeout) for sel in selectors]
-    # Return first that resolves; cancel others
+    """Return the first selector that becomes visible, or None."""
+    tasks = [asyncio.create_task(page.wait_for_selector(sel, state="visible", timeout=timeout))
+             for sel in selectors]
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    # Cancel the rest
     for p in pending:
         p.cancel()
-    if not done:
-        return None
-    # Get the selector that succeeded
-    for d in done:
-        try:
-            await d
-            # find which selector it was by trying now()
-            for sel in selectors:
-                loc = page.locator(sel)
-                if await loc.count() > 0 and await loc.first().is_visible():
-                    return sel
-        except Exception:
-            continue
+    # Figure out which selector won
+    for idx, t in enumerate(tasks):
+        if t in done and not t.cancelled() and t.exception() is None:
+            return selectors[idx]
     return None
 
 async def dump_debug(page, tag="case"):
-    # Save what we actually received
     html_path = f"/opt/render/project/src/debug_{tag}.html"
     png_path = f"/opt/render/project/src/debug_{tag}.png"
     try:
@@ -78,7 +71,7 @@ async def dump_debug(page, tag="case"):
             f.write(content)
         await page.screenshot(path=png_path, full_page=True)
         return html_path, png_path
-    except Exception as e:
+    except Exception:
         return None, None
 
 @app.post("/capture")
@@ -86,6 +79,7 @@ async def capture(case_number: str = Form(...)):
     filename = f"Voluntary_Petition_{case_number}.pdf"
 
     try:
+        # Ensure browsers are present (belt & suspenders)
         os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
         subprocess.run(["python", "-m", "playwright", "install", "chromium"], check=True)
 
@@ -102,31 +96,27 @@ async def capture(case_number: str = Form(...)):
             context = await browser.new_context(
                 accept_downloads=True,
                 viewport={"width": 1400, "height": 1800},
-                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
             )
             page = await context.new_page()
 
-            # --- Login flow ---
+            # ---- Login ----
             await page.goto("https://v2.courtdrive.com/login")
             await page.fill('input[name="email"]', COURTDRIVE_USERNAME)
             await page.fill('input[name="password"]', COURTDRIVE_PASSWORD)
             await page.click('button[type="submit"]')
             await page.wait_for_load_state("networkidle")
+            await asyncio.sleep(0.8)
 
-            # optional: wait for dashboard indicator OR user avatar/menu
-            # try to detect successful login quickly
-            await asyncio.sleep(1.0)
-
-            # --- Navigate to case ---
+            # ---- Case page ----
             case_url = f"{BASE_URL}{case_number}/dockets"
             await page.goto(case_url)
             await page.wait_for_load_state("networkidle")
             await asyncio.sleep(1.0)
 
-            # --- Find search box or detect blockers ---
+            # ---- Find search input OR detect blockers ----
             sel = await wait_for_any_selector(page, SEARCH_SELECTORS, timeout=30000)
             if not sel:
-                # Check for blocker text in DOM
                 text = (await page.content())[:100000]
                 if any(t.lower() in text.lower() for t in BLOCKER_TEXT):
                     html_path, png_path = await dump_debug(page, tag="blocker")
@@ -134,12 +124,11 @@ async def capture(case_number: str = Form(...)):
                     return JSONResponse(
                         status_code=502,
                         content={
-                            "error": "Search input not visible; page likely blocked by login/mfa/cookies modal.",
+                            "error": "Search input not visible; page likely blocked (login/MFA/cookies/upgrade).",
                             "debug_html": html_path,
-                            "debug_png": png_path
-                        }
+                            "debug_png": png_path,
+                        },
                     )
-                # Unknown layout -> dump for inspection
                 html_path, png_path = await dump_debug(page, tag="nosel")
                 await browser.close()
                 return JSONResponse(
@@ -147,21 +136,21 @@ async def capture(case_number: str = Form(...)):
                     content={
                         "error": "Search input selector not found on case dockets page.",
                         "debug_html": html_path,
-                        "debug_png": png_path
-                    }
+                        "debug_png": png_path,
+                    },
                 )
 
-            # --- Use whichever selector resolved ---
+            # ---- Use the found selector ----
             search = page.locator(sel).first
-            await search().click()
-            await search().fill("")
-            await search().type("Voluntary Petition", delay=60)
+            await search.click()
+            await search.fill("")
+            await search.type("Voluntary Petition", delay=60)
             await page.keyboard.press("Enter")
 
             await page.wait_for_selector("text=Voluntary Petition", state="visible", timeout=30000)
             await asyncio.sleep(1.0)
 
-            # --- Your tabbing sequence ---
+            # ---- Your tabbing flow ----
             for _ in range(21):
                 await page.keyboard.press("Tab")
                 await asyncio.sleep(0.1)
@@ -183,7 +172,6 @@ async def capture(case_number: str = Form(...)):
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# quick route to fetch last debug HTML if needed
 @app.get("/debug/last-html", response_class=PlainTextResponse)
 async def debug_last_html():
     path = "/opt/render/project/src/debug_nosel.html"
@@ -191,6 +179,8 @@ async def debug_last_html():
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
     return "No debug file found."
+
+
 
 
 
