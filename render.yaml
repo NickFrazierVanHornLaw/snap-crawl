@@ -3,14 +3,18 @@ services:
     name: snap-crawl
     env: python
     buildCommand: |
+      pip install --upgrade pip
       pip install -r requirements.txt
-      python -m playwright install --with-deps chromium
+      python -m playwright install chromium
+      python -m playwright install-deps
     startCommand: uvicorn server:app --host 0.0.0.0 --port 3000
     envVars:
       - key: COURTDRIVE_USERNAME
         value: chad@cvhlawgroup.com
       - key: COURTDRIVE_PASSWORD
         value: Ch@d2201
+
+
 
 
 
