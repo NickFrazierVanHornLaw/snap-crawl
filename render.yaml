@@ -2,16 +2,24 @@ services:
   - type: web
     name: snap-crawl
     env: python
-    buildCommand: >
-      pip install --upgrade pip &&
-      pip install -r requirements.txt &&
-      python -m playwright install --with-deps chromium
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+      python -m playwright install chromium
     startCommand: uvicorn server:app --host 0.0.0.0 --port 3000
     envVars:
       - key: COURTDRIVE_USERNAME
         value: chad@cvhlawgroup.com
       - key: COURTDRIVE_PASSWORD
         value: Ch@d2201
+      # Keep browsers in a stable, persisted path Render expects
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /opt/render/.cache/ms-playwright
+      # Skip host validation to avoid missing SYS deps warnings
+      - key: PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS
+        value: "1"
+
+
 
 
 
