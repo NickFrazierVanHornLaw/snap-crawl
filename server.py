@@ -8,7 +8,7 @@ app = FastAPI()
 COURTDRIVE_USERNAME = os.getenv("COURTDRIVE_USERNAME", "chad@cvhlawgroup.com")
 COURTDRIVE_PASSWORD = os.getenv("COURTDRIVE_PASSWORD", "Ch@d2201")
 HEADLESS = True
-BASE_URL = "https://v2.courtdrive.com/cases/pacer/flsbke/1:25-bk-"
+BASE_URL = "https://v2.courtdrive.com/cases/pacer/flsbke/0:25-bk-"
 BROWSER_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
 SEARCH_SELECTORS = [
     "input[placeholder*='Search']",
@@ -191,6 +191,7 @@ async def debug_last_html():
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
     return "No debug file found."
+
 
 
 
