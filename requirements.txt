@@ -1,7 +1,9 @@
 fastapi
 uvicorn
-playwright
+playwright==1.55.0
 python-multipart
+
+
 
 
 
